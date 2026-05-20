@@ -1,0 +1,24 @@
+{
+  "name": "@ultrainstinct/panel-opencode-plugin",
+  "version": "0.1.0",
+  "description": "Forward selected opencode session traces to a panel ingest endpoint for human-judged feedback (rater-loop). Sampling, novelty + error always-on, async, circuit-breakered.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": ["opencode", "panel", "telemetry", "rlhf", "captcha", "rater"],
+  "author": "UltraInstinct0x <g_guney@icloud.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/UltraInstinct0x/panel-opencode-plugin.git"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  }
+}
