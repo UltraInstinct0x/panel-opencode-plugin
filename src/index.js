@@ -362,3 +362,6 @@ export const PanelPlugin = async ({ client, project, directory }, options = {}) 
 };
 
 export default { server: PanelPlugin };
+
+// WS-V3: V1 unit-type emit helpers (skill_diff, process_output, prompt_rewrite).
+export { emitSkillDiff, emitProcessOutput, emitPromptRewrite } from './emit-units.js';
