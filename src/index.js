@@ -30,6 +30,7 @@
 //   PANEL_OPENCODE_DISABLED=1              hard kill
 
 import crypto from "node:crypto";
+import { emitSkillDiff } from "./emit-units.js";
 
 const DEFAULTS = {
   panelUrl: "http://127.0.0.1:3015",
@@ -278,6 +279,48 @@ function resolveCfg(options) {
   return cfg;
 }
 
+// ── skill_manage detection (WS-V3 wire) ───────────────────────────────────
+// Walks message parts looking for tool calls to `skill_manage` with
+// action in {patch, edit, create} and extracts the skill name + diff/content.
+// Returns [] if none found. Defensive against missing fields — opencode
+// tool-state shapes vary across versions.
+export function scanSkillEdits(messages) {
+  const out = [];
+  if (!Array.isArray(messages)) return out;
+  for (const m of messages) {
+    const parts = Array.isArray(m?.parts) ? m.parts : [];
+    for (const p of parts) {
+      if (p?.type !== "tool") continue;
+      const state = p?.state || {};
+      // tool name lives in different places across opencode versions
+      const toolName = state.tool || state.name || p?.tool || p?.name || "";
+      if (toolName !== "skill_manage") continue;
+      const input = state.input || state.args || p?.input || p?.args || {};
+      const action = String(input.action || "").toLowerCase();
+      if (!["patch", "edit", "create"].includes(action)) continue;
+      const skillName = String(input.name || input.skill || "").slice(0, 120);
+      if (!skillName) continue;
+      let diff = "";
+      let reason = action;
+      if (action === "patch") {
+        const oldStr = String(input.old_string || "").slice(0, 2000);
+        const newStr = String(input.new_string || "").slice(0, 2000);
+        diff = `--- old\n${oldStr}\n+++ new\n${newStr}`;
+        reason = "patch";
+      } else if (action === "edit") {
+        diff = String(input.content || "").slice(0, 4000);
+        reason = "edit";
+      } else if (action === "create") {
+        diff = String(input.content || "").slice(0, 4000);
+        reason = "create";
+      }
+      if (!diff) continue;
+      out.push({ skillName, diff, reason });
+    }
+  }
+  return out;
+}
+
 // ── plugin export ─────────────────────────────────────────────────────────
 export const PanelPlugin = async ({ client, project, directory }, options = {}) => {
   if (process.env.PANEL_OPENCODE_DISABLED === "1") {
@@ -334,6 +377,22 @@ export const PanelPlugin = async ({ client, project, directory }, options = {}) 
           while (lru.length > cfg.lruSize) lru.shift();
         }
         recent.push({ ts: now, sessionID, status: "ok", http: result.status, reason: decision.reason });
+
+        // WS-V3 wire: scan session for skill_manage edits and emit skill_diff units.
+        // fire-and-forget; errors don't bubble up. Gated by env to avoid surprising
+        // existing deployments that haven't minted the V3 ingest key yet.
+        if (process.env.PANEL_EMIT_ENABLED === "1") {
+          for (const edit of scanSkillEdits(trimmed)) {
+            emitSkillDiff({
+              skillName: edit.skillName,
+              diff: edit.diff,
+              reason: edit.reason,
+              profile: cfg.sourceAgent,
+            }).catch((e) => {
+              recent.push({ ts: now, sessionID, status: "v3_emit_failed", err: e?.message || String(e) });
+            });
+          }
+        }
       } else {
         breaker.recordFailure(now);
         recent.push({ ts: now, sessionID, status: "error", http: result.status, body: result.body.slice(0, 200) });
