@@ -133,38 +133,131 @@ export function decideForward({ messages, cfg, lru, force = false, rng = Math.ra
   return { forward: false, reason: "baseline", tokens, novelty };
 }
 
-// ── scrubber call ─────────────────────────────────────────────────────────
-async function scrub(scrubberUrl, body) {
-  if (!scrubberUrl) return { body, attestation: null };
-  const res = await fetch(`${scrubberUrl.replace(/\/$/, "")}/scrub`, {
+// ── opencode → splitter shape normalization ──────────────────────────────
+// panel's splitter expects {role, content: string, tool_calls?}. opencode
+// messages carry {role, parts: [{type, text|state}]}. We flatten parts
+// into a single content string while preserving tool-call presence as a
+// hinted structured tool_calls entry so the splitter can emit step_validity
+// candidates against tool steps.
+function normalizeForPanel(messages) {
+  return messages.map((m, idx) => {
+    const role = String(m?.role ?? "assistant");
+    const parts = Array.isArray(m?.parts) ? m.parts : [];
+    const textChunks = [];
+    const toolCalls = [];
+    for (const p of parts) {
+      if (typeof p?.text === "string" && p.text) textChunks.push(p.text);
+      if (p?.type === "tool") {
+        toolCalls.push({
+          name: p?.tool ?? p?.state?.tool ?? "unknown",
+          status: p?.state?.status ?? "completed",
+          error: p?.state?.error ?? null,
+          input: p?.state?.input ?? null,
+          output: p?.state?.output ?? null,
+        });
+      }
+    }
+    let content = textChunks.join("\n\n").trim();
+    if (!content && typeof m?.content === "string") content = m.content;
+    const out = { role, content };
+    if (toolCalls.length) out.tool_calls = toolCalls;
+    if (m?.id) out.id = m.id;
+    if (m?.sessionID) out.session_id = m.sessionID;
+    out.idx = idx;
+    return out;
+  });
+}
+
+// The scrubber service is text-in / text-out — it returns no attestation.
+// The plugin self-signs an HS256 attestation JWT below (the scrubber + panel
+// share SCRUBBER_JWT_SECRET out-of-band; panel verifies the JWT covers the
+// final outbound body hash).
+async function scrubText(scrubberUrl, text) {
+  if (!scrubberUrl) return text;
+  const res = await fetch(`${scrubberUrl.replace(/\/$/, "")}/v1/scrub`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body,
+    body: JSON.stringify({ text, mode: "text" }),
   });
   if (!res.ok) throw new Error(`scrubber_${res.status}`);
   const json = await res.json();
-  // contract: scrubber returns { sanitized: <json string>, attestation: <jwt> }
-  return {
-    body: typeof json.sanitized === "string" ? json.sanitized : JSON.stringify(json.sanitized),
-    attestation: json.attestation || null,
-  };
+  return typeof json?.text === "string" ? json.text : text;
+}
+
+function b64url(buf) {
+  return Buffer.from(buf).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function signHs256(secret, payload) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const si = b64url(JSON.stringify(header)) + "." + b64url(JSON.stringify(payload));
+  const sig = crypto.createHmac("sha256", secret).update(si).digest();
+  return `${si}.${b64url(sig)}`;
+}
+
+async function scrubMessages(scrubberUrl, messages) {
+  if (!scrubberUrl) return messages;
+  const out = [];
+  for (const m of messages) {
+    const next = { ...m };
+    if (typeof m?.content === "string" && m.content) {
+      next.content = await scrubText(scrubberUrl, m.content);
+    }
+    if (Array.isArray(m?.tool_calls)) {
+      next.tool_calls = await Promise.all(
+        m.tool_calls.map(async (tc) => {
+          const t = { ...tc };
+          if (typeof tc?.input === "string" && tc.input) t.input = await scrubText(scrubberUrl, tc.input);
+          if (typeof tc?.output === "string" && tc.output) t.output = await scrubText(scrubberUrl, tc.output);
+          return t;
+        })
+      );
+    }
+    out.push(next);
+  }
+  return out;
 }
 
 // ── panel ingest ──────────────────────────────────────────────────────────
 async function shipToPanel(cfg, payload) {
-  const raw = JSON.stringify(payload);
-  const { body, attestation } = await scrub(cfg.scrubberUrl, raw);
+  // 1. opencode shape → splitter shape
+  const normalized = normalizeForPanel(payload.blob.messages);
+  // 2. per-message scrub (text-only; preserves shape)
+  const scrubbed = {
+    ...payload,
+    blob: { ...payload.blob, messages: await scrubMessages(cfg.scrubberUrl, normalized) },
+  };
+  // 2. canonical JSON body
+  const body = JSON.stringify(scrubbed);
+
+  // 3. site HMAC over body
   const upper = cfg.siteKey.toUpperCase().replace(/[^A-Z0-9]/g, "_");
-  const secret =
+  const ingestSecret =
     process.env[`PANEL_INGEST_SECRET_${upper}`] || process.env.PANEL_INGEST_SECRET || "";
-  if (!secret) throw new Error("ingest_secret_missing");
-  const sig = crypto.createHmac("sha256", secret).update(body).digest("hex");
+  if (!ingestSecret) throw new Error("ingest_secret_missing");
+  const sig = crypto.createHmac("sha256", ingestSecret).update(body).digest("hex");
+
+  // 4. attestation JWT (self-signed; covers output_hash = sha256(body))
   const headers = {
     "content-type": "application/json",
     "x-panel-site-key": cfg.siteKey,
     "x-panel-ingest-sig": sig,
   };
-  if (attestation) headers["x-scrubber-attestation"] = attestation;
+  const scrubberSecret = process.env.SCRUBBER_JWT_SECRET || "";
+  if (cfg.scrubberUrl && scrubberSecret) {
+    const now = Math.floor(Date.now() / 1000);
+    const token = signHs256(scrubberSecret, {
+      jti: crypto.randomBytes(16).toString("hex"),
+      iat: now,
+      exp: now + 300,
+      input_hash: "x",
+      output_hash: crypto.createHash("sha256").update(body).digest("hex"),
+      mode: "text",
+      engine_version: "0.2.0",
+    });
+    headers["x-scrubber-attestation"] = token;
+  }
+
   const res = await fetch(`${cfg.panelUrl.replace(/\/$/, "")}/api/v1/traces`, {
     method: "POST",
     headers,
