@@ -1,90 +1,101 @@
 # panel-opencode-plugin
 
-Forward a sampled subset of [opencode](https://opencode.ai) session traces to a [panel](https://panel.goku.codes) ingest endpoint so that rater pools can judge real agent output (skill diffs, step validity, hallucinations, pairwise comparisons).
-
-Companion to the hermes-side [`panel_trace_forwarder`](https://github.com/UltraInstinct0x/panel-sdk-node). Same contract, same sampling defaults, same circuit-breaker shape.
+Forward sampled [opencode](https://opencode.ai) session traces to panel `POST /api/v1/traces` for downstream rater-unit generation.
 
 ## Install
 
 ```bash
 opencode plugin install @ultrainstinct/panel-opencode-plugin
-# or locally during dev:
-cd ~/.opencode && bun add file:/path/to/panel-opencode-plugin
 ```
 
-Then in `~/.opencode/opencode.json`:
+## opencode.json example
 
-```jsonc
+```json
 {
   "plugin": [
-    ["@ultrainstinct/panel-opencode-plugin", {
-      "panelUrl": "https://panel.goku.codes",
-      "scrubberUrl": "https://scrubber.goku.codes",
-      "siteKey": "pk_live_yourkey",
-      "sourceAgent": "opencode",
-      "samplingRate": 0.05
-    }]
+    [
+      "@ultrainstinct/panel-opencode-plugin",
+      {
+        "panelUrl": "https://panel.goku.codes",
+        "scrubberUrl": "https://scrubber.goku.codes",
+        "siteKey": "pk_live_example",
+        "sourceAgent": "opencode",
+        "samplingRate": 0.05,
+        "samplingRateOverride": false,
+        "noveltyThreshold": 0.7,
+        "lruSize": 200,
+        "maxMessages": 25,
+        "dryRun": false
+      }
+    ]
   ]
 }
 ```
 
-Provide the ingest secret in the env that runs opencode:
+## Config + env reference
+
+| Option | Default | Env override | Description |
+|---|---:|---|---|
+| `panelUrl` | `http://127.0.0.1:3015` | — | Panel base URL |
+| `scrubberUrl` | `http://127.0.0.1:3017` | — | Scrubber base URL (`""` disables scrubber) |
+| `siteKey` | `pk_test_thirdparty` | — | Sent as `X-Panel-Site-Key` |
+| `sourceAgent` | `opencode` | — | `source_agent` field in trace payload |
+| `samplingRate` | `0.05` | — | Baseline random forwarding rate |
+| `samplingRateOverride` | `false` | — | Allows rates above 0.25 cap |
+| `noveltyThreshold` | `0.7` | — | Forward when novelty score is `>=` threshold |
+| `lruSize` | `200` | — | Token-set history size for novelty checks |
+| `maxMessages` | `25` | — | Tail messages included in trace blob |
+| `dryRun` | `false` | — | Log/decide but do not POST to panel |
+
+| Environment variable | Required | Purpose |
+|---|---|---|
+| `PANEL_INGEST_SECRET_<UPPER_SITE_KEY>` | Yes (or fallback below) | Site-specific HMAC secret |
+| `PANEL_INGEST_SECRET` | Fallback | Global HMAC secret fallback |
+| `SCRUBBER_JWT_SECRET` | If scrubber-attestation required | HS256 secret for self-signed `X-Scrubber-Attestation` |
+| `PANEL_OPENCODE_DISABLED=1` | Optional | Hard-disable plugin (returns no hooks) |
+| `PANEL_OPENCODE_ENABLED=1` | Optional | Force-on toggle for ops compatibility |
+
+## Behavior summary
+
+- Trigger: `session.idle`
+- Forward when any of:
+  - novelty score `>= noveltyThreshold`
+  - error in message/tool state
+  - baseline sampling hit
+- Scrubber flow: plugin calls `POST /v1/scrub` and uses response `{ scrubbed, mapping_id?, ... }`
+- Ingest auth headers:
+  - `X-Panel-Site-Key`
+  - `X-Panel-Ingest-Sig` (`hex(HMAC_SHA256(secret, raw_body_bytes))`)
+  - `X-Scrubber-Attestation` (HS256 JWT) when scrubber secret available
+- Fire-and-forget send to `POST /api/v1/traces`
+- Treats `202 Accepted` as success (async trace splitting path)
+
+## Troubleshooting
+
+### Circuit breaker open
+
+If panel returns 3 non-2xx responses within 60s, breaker opens for 5 minutes and forwarding pauses.
+
+### 401 / `ingest_secret_missing`
+
+Set `PANEL_INGEST_SECRET_<UPPER_SITE_KEY>` (or `PANEL_INGEST_SECRET`) in the environment where opencode runs.
+
+### 422 `scrubber_attestation_required`
+
+Panel site key is scrubber-gated. Ensure `SCRUBBER_JWT_SECRET` is set and matches panel verification secret.
+
+### 202 async response
+
+Large blobs can return `202` with poll location. This plugin treats that as success and does not trip circuit breaker.
+
+### dryRun mode
+
+Set `dryRun: true` to evaluate decisions and payload intent without network POST.
+
+## Tests
 
 ```bash
-export PANEL_INGEST_SECRET_PK_LIVE_YOURKEY=...  # HMAC site secret
-export SCRUBBER_JWT_SECRET=...                  # if scrubber required for this site
+npm test
 ```
 
-## Sampling policy (D17)
-
-A session is forwarded when **any** of:
-
-- baseline random sample (default 5%, soft-capped at 25% unless `samplingRateOverride: true`)
-- session contains a tool/agent error
-- session content is *novel*: jaccard over the last 8 messages' token sets is < 0.3 vs the LRU of the last 200 shipped sessions
-
-Decision happens on the `session.idle` event. The request is fire-and-forget — the agent loop is **never blocked**.
-
-## Circuit breaker
-
-3 non-2xx panel responses within 60s open the breaker for 5 minutes. While open, the plugin records `circuit_open` in its in-memory ring and ships nothing.
-
-## Privacy
-
-If `scrubberUrl` is set (default `http://127.0.0.1:3017`), every blob is POSTed to `/scrub` first and the sanitized version + attestation JWT is what reaches panel. Set `scrubberUrl: ""` to bypass (dev only).
-
-## Config reference
-
-| key | default | meaning |
-|-----|---------|---------|
-| `panelUrl` | `http://127.0.0.1:3015` | panel base URL |
-| `scrubberUrl` | `http://127.0.0.1:3017` | scrubber base URL (empty disables) |
-| `siteKey` | `pk_test_thirdparty` | panel site key |
-| `sourceAgent` | `opencode` | written into the trace |
-| `samplingRate` | `0.05` | 0–0.25 (raise cap with override) |
-| `samplingRateOverride` | `false` | unlock rates above the 0.25 soft cap |
-| `noveltyThreshold` | `0.7` | `1 - jaccard_max` cutoff |
-| `lruSize` | `200` | LRU of previously-shipped token sets |
-| `maxMessages` | `25` | tail of session messages included in blob |
-
-## Env
-
-| var | meaning |
-|-----|---------|
-| `PANEL_INGEST_SECRET_<UPPER_SITE_KEY>` | HMAC site secret (required) |
-| `SCRUBBER_JWT_SECRET` | HS256 secret if scrubber gates with attestation |
-| `PANEL_OPENCODE_ENABLED=1` | force-on |
-| `PANEL_OPENCODE_DISABLED=1` | hard kill (plugin returns no hooks) |
-
-## Testing
-
-```bash
-cd panel-opencode-plugin
-node --test test/*.test.js
-```
-
-Includes a stub panel server + stub opencode client for end-to-end integration coverage without touching the network or a real opencode install.
-
-## License
-
-MIT — UltraInstinct0x
+Coverage includes decision logic, HMAC determinism, JWT shape/signing, circuit breaker behavior, sampling cap behavior, and integration paths (`200`, `202`, scrubber, dry-run).

@@ -47,6 +47,12 @@ const DEFAULTS = {
 const SOFT_SAMPLING_CAP = 0.25;
 
 // ── circuit breaker ───────────────────────────────────────────────────────
+/**
+ * Create an in-memory circuit breaker for panel shipping failures.
+ * Opens after `threshold` failures within `windowMs` and auto-closes after `cooldownMs`.
+ *
+ * @returns {{failures:number[],openedAt:number,windowMs:number,cooldownMs:number,threshold:number,recordFailure:(now:number)=>void,isOpen:(now:number)=>boolean}}
+ */
 function makeBreaker() {
   return {
     failures: [],
@@ -73,6 +79,12 @@ function makeBreaker() {
 }
 
 // ── novelty (jaccard over token sets, last-N message window) ──────────────
+/**
+ * Build a token set from recent message text.
+ *
+ * @param {Array<any>} messages
+ * @returns {Set<string>}
+ */
 function tokenSet(messages) {
   const tokens = new Set();
   const window = messages.slice(-8);
@@ -91,6 +103,13 @@ function tokenSet(messages) {
   return tokens;
 }
 
+/**
+ * Calculate novelty as `1 - max_jaccard` against a token-set LRU.
+ *
+ * @param {Set<string>} tokens
+ * @param {Array<Set<string>>} lru
+ * @returns {number}
+ */
 function noveltyScore(tokens, lru) {
   if (!tokens.size || !lru.length) return 1.0;
   let best = 0;
@@ -107,6 +126,12 @@ function noveltyScore(tokens, lru) {
 }
 
 // ── error detection ───────────────────────────────────────────────────────
+/**
+ * Detect whether any message/tool part indicates an error.
+ *
+ * @param {Array<any>} messages
+ * @returns {boolean}
+ */
 function hasError(messages) {
   for (const m of messages) {
     if (m?.error) return true;
@@ -120,6 +145,12 @@ function hasError(messages) {
 }
 
 // ── decision ──────────────────────────────────────────────────────────────
+/**
+ * Decide whether a session trace should be forwarded.
+ *
+ * @param {{messages:Array<any>,cfg:{samplingRate:number,noveltyThreshold:number},lru:Array<Set<string>>,force?:boolean,rng?:()=>number}} args
+ * @returns {{forward:boolean,reason:string,tokens?:Set<string>,novelty?:number}}
+ */
 export function decideForward({ messages, cfg, lru, force = false, rng = Math.random }) {
   if (force) return { forward: true, reason: "force" };
   if (hasError(messages)) return { forward: true, reason: "error_flag" };
@@ -140,6 +171,12 @@ export function decideForward({ messages, cfg, lru, force = false, rng = Math.ra
 // into a single content string while preserving tool-call presence as a
 // hinted structured tool_calls entry so the splitter can emit step_validity
 // candidates against tool steps.
+/**
+ * Normalize opencode message shape to panel splitter message shape.
+ *
+ * @param {Array<any>} messages
+ * @returns {Array<any>}
+ */
 function normalizeForPanel(messages) {
   return messages.map((m, idx) => {
     const role = String(m?.role ?? "assistant");
@@ -173,22 +210,47 @@ function normalizeForPanel(messages) {
 // The plugin self-signs an HS256 attestation JWT below (the scrubber + panel
 // share SCRUBBER_JWT_SECRET out-of-band; panel verifies the JWT covers the
 // final outbound body hash).
+/**
+ * Call scrubber `/v1/scrub` for a single text value.
+ *
+ * @param {string} scrubberUrl
+ * @param {string} text
+ * @returns {Promise<string>}
+ */
 async function scrubText(scrubberUrl, text) {
   if (!scrubberUrl) return text;
+  const scrubberHeaders = { "content-type": "application/json" };
+  const scrubberKey = process.env.SCRUBBER_API_KEY || process.env.SCRUBBER_KEY || "";
+  if (scrubberKey) scrubberHeaders["x-scrubber-key"] = scrubberKey;
   const res = await fetch(`${scrubberUrl.replace(/\/$/, "")}/v1/scrub`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: scrubberHeaders,
     body: JSON.stringify({ text, mode: "text" }),
   });
   if (!res.ok) throw new Error(`scrubber_${res.status}`);
   const json = await res.json();
-  return typeof json?.text === "string" ? json.text : text;
+  if (typeof json?.scrubbed === "string") return json.scrubbed;
+  if (typeof json?.text === "string") return json.text;
+  return text;
 }
 
+/**
+ * Base64url-encode bytes or text.
+ *
+ * @param {Buffer|string} buf
+ * @returns {string}
+ */
 function b64url(buf) {
   return Buffer.from(buf).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
 
+/**
+ * Sign an HS256 JWT token.
+ *
+ * @param {string} secret
+ * @param {Record<string, any>} payload
+ * @returns {string}
+ */
 function signHs256(secret, payload) {
   const header = { alg: "HS256", typ: "JWT" };
   const si = b64url(JSON.stringify(header)) + "." + b64url(JSON.stringify(payload));
@@ -196,6 +258,13 @@ function signHs256(secret, payload) {
   return `${si}.${b64url(sig)}`;
 }
 
+/**
+ * Scrub normalized messages (content and tool text fields).
+ *
+ * @param {string} scrubberUrl
+ * @param {Array<any>} messages
+ * @returns {Promise<Array<any>>}
+ */
 async function scrubMessages(scrubberUrl, messages) {
   if (!scrubberUrl) return messages;
   const out = [];
@@ -220,6 +289,13 @@ async function scrubMessages(scrubberUrl, messages) {
 }
 
 // ── panel ingest ──────────────────────────────────────────────────────────
+/**
+ * Ship a scrubbed trace payload to panel ingest.
+ *
+ * @param {Record<string, any>} cfg
+ * @param {Record<string, any>} payload
+ * @returns {Promise<{status:number,body:string,json:any|null}>}
+ */
 async function shipToPanel(cfg, payload) {
   // 1. opencode shape → splitter shape
   const normalized = normalizeForPanel(payload.blob.messages);
@@ -241,8 +317,8 @@ async function shipToPanel(cfg, payload) {
   // 4. attestation JWT (self-signed; covers output_hash = sha256(body))
   const headers = {
     "content-type": "application/json",
-    "x-panel-site-key": cfg.siteKey,
-    "x-panel-ingest-sig": sig,
+    "X-Panel-Site-Key": cfg.siteKey,
+    "X-Panel-Ingest-Sig": sig,
   };
   const scrubberSecret = process.env.SCRUBBER_JWT_SECRET || "";
   if (cfg.scrubberUrl && scrubberSecret) {
@@ -256,7 +332,7 @@ async function shipToPanel(cfg, payload) {
       mode: "text",
       engine_version: "0.2.0",
     });
-    headers["x-scrubber-attestation"] = token;
+    headers["X-Scrubber-Attestation"] = token;
   }
 
   const res = await fetch(`${cfg.panelUrl.replace(/\/$/, "")}/api/v1/traces`, {
@@ -264,10 +340,23 @@ async function shipToPanel(cfg, payload) {
     headers,
     body,
   });
-  return { status: res.status, body: await res.text() };
+  const txt = await res.text();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(txt);
+  } catch {
+    parsed = null;
+  }
+  return { status: res.status, body: txt, json: parsed };
 }
 
 // ── config resolution ─────────────────────────────────────────────────────
+/**
+ * Resolve plugin configuration with defaults and sampling guardrails.
+ *
+ * @param {Record<string, any>} options
+ * @returns {Record<string, any>}
+ */
 function resolveCfg(options) {
   const cfg = { ...DEFAULTS, ...(options || {}) };
   let rate = Number(cfg.samplingRate);
@@ -276,6 +365,7 @@ function resolveCfg(options) {
     rate = SOFT_SAMPLING_CAP;
   }
   cfg.samplingRate = rate;
+  cfg.dryRun = cfg.dryRun === true;
   return cfg;
 }
 
@@ -322,6 +412,13 @@ export function scanSkillEdits(messages) {
 }
 
 // ── plugin export ─────────────────────────────────────────────────────────
+/**
+ * opencode plugin entrypoint.
+ *
+ * @param {{client:any,project:any,directory:string}} runtime
+ * @param {Record<string, any>} options
+ * @returns {Promise<{event:({event:any})=>Promise<void>}|{}>}
+ */
 export const PanelPlugin = async ({ client, project, directory }, options = {}) => {
   if (process.env.PANEL_OPENCODE_DISABLED === "1") {
     return {}; // hard kill
@@ -367,16 +464,31 @@ export const PanelPlugin = async ({ client, project, directory }, options = {}) 
           directory,
           messages: trimmed,
           reason: decision.reason,
-          plugin_version: "0.1.0",
+          plugin_version: "0.2.0",
         },
       };
+      if (cfg.dryRun) {
+        recent.push({ ts: now, sessionID, status: "dry_run", reason: decision.reason, trace_id: payload.trace_id });
+        return;
+      }
       const result = await shipToPanel(cfg, payload);
       if (result.status >= 200 && result.status < 300) {
         if (decision.tokens) {
           lru.push(decision.tokens);
           while (lru.length > cfg.lruSize) lru.shift();
         }
-        recent.push({ ts: now, sessionID, status: "ok", http: result.status, reason: decision.reason });
+        recent.push({
+          ts: now,
+          sessionID,
+          status: result.status === 202 ? "accepted_async" : "ok",
+          http: result.status,
+          reason: decision.reason,
+          trace_id: result.json?.trace_id,
+          unit_ids: Array.isArray(result.json?.unit_ids) ? result.json.unit_ids.length : undefined,
+          structural_count: result.json?.structural_count,
+          llm_count: result.json?.llm_count,
+          skipped_count: result.json?.skipped_count,
+        });
 
         // WS-V3 wire: scan session for skill_manage edits and emit skill_diff units.
         // fire-and-forget; errors don't bubble up. Gated by env to avoid surprising
@@ -423,4 +535,5 @@ export const PanelPlugin = async ({ client, project, directory }, options = {}) 
 export default { server: PanelPlugin };
 
 // WS-V3: V1 unit-type emit helpers (skill_diff, process_output, prompt_rewrite).
-export { emitSkillDiff, emitProcessOutput, emitPromptRewrite } from './emit-units.js';
+export { emitSkillDiff, emitProcessOutput, emitPromptRewrite } from "./emit-units.js";
+export { makeBreaker, signHs256, resolveCfg, shipToPanel };
