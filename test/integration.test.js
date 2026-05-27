@@ -10,7 +10,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { PanelPlugin } from "../src/index.js";
 
-function startStubPanel() {
+function startStubPanel({ status = 200, payload } = {}) {
   const received = [];
   const server = http.createServer((req, res) => {
     let body = "";
@@ -22,8 +22,43 @@ function startStubPanel() {
         headers: req.headers,
         body,
       });
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify(
+          payload ||
+            {
+              trace_id: "tr_stub_xxx",
+              unit_ids: [],
+              structural_count: 0,
+              llm_count: 0,
+              skipped_count: 0,
+            }
+        )
+      );
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        stop: () => new Promise((r) => server.close(() => r())),
+        received,
+      });
+    });
+  });
+}
+
+function startStubScrubber() {
+  const received = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      received.push({ method: req.method, url: req.url, body });
+      const input = JSON.parse(body || "{}");
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ trace_id: "tr_stub_xxx", unit_ids: [], structural_count: 0, llm_count: 0, skipped_count: 0 }));
+      res.end(JSON.stringify({ scrubbed: `SCRUBBED(${String(input.text || "")})` }));
     });
   });
   return new Promise((resolve) => {
@@ -123,5 +158,80 @@ test("disable kill-switch: PANEL_OPENCODE_DISABLED=1 returns empty hooks", async
     assert.deepEqual(hooks, {});
   } finally {
     delete process.env.PANEL_OPENCODE_DISABLED;
+  }
+});
+
+test("dryRun=true logs intent and does not POST", async () => {
+  process.env.PANEL_INGEST_SECRET_PK_TEST_DRYRUN = "shhh";
+  const panel = await startStubPanel();
+  try {
+    const hooks = await PanelPlugin(
+      {
+        client: makeStubClient([{ role: "user", parts: [{ type: "text", text: "dry run payload" }] }]),
+        project: { id: "p" },
+        directory: "/tmp",
+      },
+      { panelUrl: panel.url, scrubberUrl: "", siteKey: "pk_test_dryrun", dryRun: true, samplingRate: 1, samplingRateOverride: true }
+    );
+
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "ses_dryrun" } } });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(panel.received.length, 0);
+  } finally {
+    await panel.stop();
+    delete process.env.PANEL_INGEST_SECRET_PK_TEST_DRYRUN;
+  }
+});
+
+test("scrubber response uses .scrubbed shape", async () => {
+  process.env.PANEL_INGEST_SECRET_PK_TEST_SCRUB = "shhh";
+  const panel = await startStubPanel();
+  const scrubber = await startStubScrubber();
+  try {
+    const hooks = await PanelPlugin(
+      {
+        client: makeStubClient([{ role: "user", parts: [{ type: "text", text: "my email is jane@example.com" }] }]),
+        project: { id: "p" },
+        directory: "/tmp",
+      },
+      { panelUrl: panel.url, scrubberUrl: scrubber.url, siteKey: "pk_test_scrub", samplingRate: 1, samplingRateOverride: true }
+    );
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "ses_scrub" } } });
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(panel.received.length, 1);
+    assert.ok(scrubber.received.length >= 1);
+    const shipped = JSON.parse(panel.received[0].body);
+    assert.match(shipped.blob.messages[0].content, /^SCRUBBED\(/);
+  } finally {
+    await scrubber.stop();
+    await panel.stop();
+    delete process.env.PANEL_INGEST_SECRET_PK_TEST_SCRUB;
+  }
+});
+
+test("202 async accept is treated as success (breaker remains closed)", async () => {
+  process.env.PANEL_INGEST_SECRET_PK_TEST_ASYNC = "shhh";
+  const panel = await startStubPanel({ status: 202, payload: { trace_id: "tr_async", status: "pending", poll: "/v1/traces/tr_async" } });
+  try {
+    const hooks = await PanelPlugin(
+      {
+        client: makeStubClient([{ role: "user", parts: [{ type: "text", text: "repeat payload for async acceptance" }] }]),
+        project: { id: "p" },
+        directory: "/tmp",
+      },
+      { panelUrl: panel.url, scrubberUrl: "", siteKey: "pk_test_async", samplingRate: 1, samplingRateOverride: true }
+    );
+
+    for (let i = 0; i < 4; i += 1) {
+      await hooks.event({ event: { type: "session.idle", properties: { sessionID: `ses_async_${i}` } } });
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    await new Promise((r) => setTimeout(r, 120));
+
+    assert.equal(panel.received.length, 4);
+  } finally {
+    await panel.stop();
+    delete process.env.PANEL_INGEST_SECRET_PK_TEST_ASYNC;
   }
 });

@@ -66,3 +66,23 @@ test("empty messages, empty lru → novelty 1.0, forwards as novelty", () => {
   assert.equal(d.forward, true);
   assert.equal(d.reason, "novelty");
 });
+
+test("novelty threshold edge: equal threshold forwards as novelty", () => {
+  const lru = [new Set(["a", "b", "c"])];
+  const messages = [{ role: "user", parts: [{ type: "text", text: "a b c d e" }] }];
+  const cfg = { ...CFG, noveltyThreshold: 0.4 };
+  const d = decideForward({ messages, cfg, lru, rng: () => 0.99 });
+  assert.equal(d.novelty, 0.4);
+  assert.equal(d.forward, true);
+  assert.equal(d.reason, "novelty");
+});
+
+test("novelty just below threshold falls back to baseline/sample", () => {
+  const lru = [new Set(["a", "b", "c", "d", "e"])];
+  const messages = [{ role: "user", parts: [{ type: "text", text: "a b c d e" }] }];
+  const cfg = { ...CFG, noveltyThreshold: 0.01 };
+  const d = decideForward({ messages, cfg, lru, rng: () => 0.99 });
+  assert.equal(d.novelty, 0);
+  assert.equal(d.forward, false);
+  assert.equal(d.reason, "baseline");
+});
